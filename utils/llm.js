@@ -81,26 +81,72 @@ async function fetchWebEvidence(searchQuery, maxResults = 3) {
     return [];
   }
 
-  try {
-    const resp = await axios.post(
-      `${DDGS_SERVICE_URL}/search`,
-      { query: searchQuery, max_results: maxResults },
-      {
-        headers: DDGS_SERVICE_SECRET ? { 'X-Service-Secret': DDGS_SERVICE_SECRET } : {},
-        timeout: 15000,
-      }
-    );
+  // Render free-tier services spin down after ~15 min idle and can take
+  // 30-60+ seconds to cold-start on the next request. A single request
+  // with a short timeout can hit a 502 mid-wake-up. Retry once with a
+  // longer timeout on transient failures (502/503/connection errors)
+  // before giving up — the same pattern used for the vision node calls.
+  const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504]);
+  const TRANSIENT_ERROR_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE']);
+  const attempts = [
+    { timeoutMs: 15000 },
+    { timeoutMs: 45000 },
+    { timeoutMs: 5000 },
+     // longer budget for a cold-start retry
+  ];
 
-    const { results, note } = resp.data;
-    if (note) {
-      console.log(`[llm.js] ddgs_service note for "${searchQuery}": ${note}`);
+  let lastErrorDetail = null;
+
+  for (let i = 0; i < attempts.length; i++) {
+    const { timeoutMs } = attempts[i];
+    const attemptStart = Date.now();
+    try {
+      console.log(
+        `[llm.js] ddgs_service attempt ${i + 1}/${attempts.length} for "${searchQuery}" (timeout ${timeoutMs}ms)`
+      );
+      const resp = await axios.post(
+        `${DDGS_SERVICE_URL}/search`,
+        { query: searchQuery, max_results: maxResults },
+        {
+          headers: DDGS_SERVICE_SECRET ? { 'X-Service-Secret': DDGS_SERVICE_SECRET } : {},
+          timeout: timeoutMs,
+        }
+      );
+
+      const elapsedMs = Date.now() - attemptStart;
+      console.log(`[llm.js] ddgs_service attempt ${i + 1} succeeded in ${elapsedMs}ms`);
+
+      const { results, note } = resp.data;
+      if (note) {
+        console.log(`[llm.js] ddgs_service note for "${searchQuery}": ${note}`);
+      }
+      return (results || []).map((r) => ({ title: r.title, url: r.url, body: r.body }));
+    } catch (err) {
+      const elapsedMs = Date.now() - attemptStart;
+      const httpStatus = err.response ? err.response.status : null;
+      lastErrorDetail = err.response
+        ? `HTTP ${httpStatus}`
+        : `${err.code || 'unknown'}: ${err.message}`;
+
+      console.error(
+        `[llm.js] ddgs_service attempt ${i + 1} FAILED after ${elapsedMs}ms — ${lastErrorDetail}`
+      );
+
+      const isTransient =
+        (httpStatus && TRANSIENT_HTTP_STATUSES.has(httpStatus)) ||
+        (err.code && TRANSIENT_ERROR_CODES.has(err.code));
+      const hasAttemptsLeft = i < attempts.length - 1;
+
+      if (isTransient && hasAttemptsLeft) {
+        console.log(`[llm.js] Treating "${lastErrorDetail}" as transient (likely cold start) — retrying...`);
+        continue;
+      }
+      break;
     }
-    return (results || []).map((r) => ({ title: r.title, url: r.url, body: r.body }));
-  } catch (err) {
-    const detail = err.response ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}` : err.message;
-    console.error(`[llm.js] ddgs_service request failed for "${searchQuery}": ${detail}`);
-    return [];
   }
+
+  console.error(`[llm.js] ddgs_service request ultimately failed for "${searchQuery}": ${lastErrorDetail}`);
+  return [];
 }
 
 async function evaluateSingleClaim(claim, evidenceList) {
