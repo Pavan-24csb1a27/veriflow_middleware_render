@@ -1,5 +1,5 @@
 const express = require('express');
-const VisionNode = require('../models/VisionNode');
+const VisionNode = require('../models/visionNode');
 
 const router = express.Router();
 
