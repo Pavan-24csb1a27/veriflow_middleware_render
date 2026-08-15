@@ -1,0 +1,5 @@
+node_modules
+.env
+ddgs_service
+package.json
+package-lock.json
