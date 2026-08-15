@@ -48,3 +48,20 @@ mongoose
     console.error('[server] MongoDB connection failed:', err.message);
     process.exit(1);
   });
+
+// --- Loud shutdown logging ---
+// If you're running with `npm run dev` (node --watch), ANY file save in
+// this project — even an unrelated one, or an editor autosave — restarts
+// this whole process. If that happens while an in-flight request to the
+// vision node is open, the underlying TCP/TLS connection gets torn down,
+// which surfaces as things like "Client network socket disconnected
+// before secure TLS connection was established" on the axios side. These
+// logs make that restart impossible to miss when reading server output.
+// For actual demo/testing sessions where you don't want this risk, use
+// `npm run stable` instead (no file-watching, no surprise restarts).
+process.on('SIGTERM', () => {
+  console.warn('[server] Received SIGTERM — shutting down (likely a --watch-triggered restart).');
+});
+process.on('SIGINT', () => {
+  console.warn('[server] Received SIGINT — shutting down.');
+});

@@ -1,126 +1,84 @@
 const express = require('express');
-const axios = require('axios');
-const { requireAuth } = require('../middleware/auth');
-const { getActiveVisionNodeUrl } = require('./visionNode');
-const Analysis = require('../models/Analysis');
-const { runFactCheck } = require('../utils/llm');
+const VisionNode = require('../models/VisionNode');
 
 const router = express.Router();
 
-const VISION_REQUEST_TIMEOUT_MS = 25000;
+// How stale a registration can be before we consider the laptop offline.
+// The laptop should re-ping this endpoint more often than this interval
+// (see the heartbeat script) so lastSeenAt stays fresh while it's running.
+const STALE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 
-// POST /analyze
-// Always runs the Groq-based text fact-check (if text is provided).
-// Only attempts the image pipeline (ViT/CLIP/reverse-image-search) if a
-// vision node is currently registered and reachable — otherwise responds
-// with a clear "image processing not available" status instead of
-// silently skipping it or hanging on a dead connection.
-router.post('/', requireAuth, async (req, res) => {
-  const { text = '', images = [], image_url: imageUrl = null } = req.body;
-
-  if (!text.trim() && images.length === 0) {
-    return res.status(400).json({ error: 'Provide text, an image, or both.' });
-  }
-
-  const responsePayload = {
-    status: 'completed',
-    text_veracity_report: text.trim() ? null : 'No text asset submitted.',
-    trust_score: null,
-    image_forensics: null,
-    clip_semantic_alignment: null,
-    reverse_image_search: null,
-    image_pipeline_available: false,
-  };
-
-  // --- Run text fact-check (Groq) and image pipeline (laptop, if online)
-  // CONCURRENTLY rather than sequentially. Awaiting them one after another
-  // means the vision request doesn't even fire until the entire Groq
-  // pipeline finishes — needless latency, and it means a slow/failed Groq
-  // call can push the vision request later than intended.
-  const tasks = [];
-
-  if (text.trim()) {
-    tasks.push(
-      runFactCheck(text)
-        .then((result) => {
-          responsePayload.text_veracity_report = result.report;
-          responsePayload.trust_score = result.trustScore;
-        })
-        .catch((err) => {
-          console.error('[analyze] fact-check failed:', err.message);
-          responsePayload.text_veracity_report = `Component failed: ${err.message}`;
-        })
-    );
-  }
-
-  if (images.length > 0) {
-    tasks.push(
-      (async () => {
-        const visionNodeUrl = await getActiveVisionNodeUrl();
-        console.log(`[analyze] getActiveVisionNodeUrl() returned: ${visionNodeUrl}`); // TEMP DEBUG — remove once confirmed
-
-        if (!visionNodeUrl) {
-          responsePayload.image_forensics = {
-            error: 'Image processing not available right now — the vision server is offline. Turn it on and try again.',
-          };
-          responsePayload.clip_semantic_alignment = images.length && text.trim()
-            ? { error: 'Image processing not available right now — the vision server is offline.' }
-            : null;
-          responsePayload.image_pipeline_available = false;
-          return;
-        }
-
-        try {
-          console.log(`[analyze] Sending vision request to: ${visionNodeUrl}/analyze`); // TEMP DEBUG — remove once confirmed
-          const visionResponse = await axios.post(
-            `${visionNodeUrl}/analyze`,
-            { text, images, image_url: imageUrl },
-            {
-              timeout: VISION_REQUEST_TIMEOUT_MS,
-              headers: {
-                // Required for free-tier ngrok URLs — without this header,
-                // ngrok serves an interstitial browser warning page instead
-                // of forwarding the request, which can surface here as a
-                // malformed response or connection reset rather than a
-                // clean error.
-                'ngrok-skip-browser-warning': 'true',
-              },
-            }
-          );
-
-          responsePayload.image_forensics = visionResponse.data.image_forensics;
-          responsePayload.clip_semantic_alignment = visionResponse.data.clip_semantic_alignment;
-          responsePayload.reverse_image_search = visionResponse.data.reverse_image_search;
-          responsePayload.image_pipeline_available = true;
-        } catch (err) {
-          console.error('[analyze] vision node request failed:', err.message);
-          responsePayload.image_forensics = {
-            error: `Vision server did not respond in time or errored: ${err.message}`,
-          };
-          responsePayload.image_pipeline_available = false;
-        }
-      })()
-    );
-  }
-
-  await Promise.allSettled(tasks);
-
-  // --- Persist to history (best-effort — a logging failure shouldn't
-  // fail the user's actual request) ---
+// POST /vision-node/register
+// Called by the laptop's FastAPI service (or a small heartbeat script)
+// on startup and periodically afterward. Requires a shared secret so
+// random callers can't register a malicious URL as the "vision node" —
+// that would let someone else's server receive images/text your users
+// submit through the extension.
+router.post('/register', async (req, res) => {
   try {
-    await Analysis.create({
-      userId: req.user.id,
-      inputText: text,
-      hasImage: images.length > 0,
-      imageUrl: imageUrl,
-      result: responsePayload,
-      imagePipelineUsed: responsePayload.image_pipeline_available,
-    });
-  } catch (err) {
-    console.error('[analyze] failed to save history entry:', err.message);
-  }
+    const { url, secret } = req.body;
 
-  res.json(responsePayload);
+    if (!secret || secret !== process.env.VISION_NODE_SECRET) {
+      return res.status(403).json({ error: 'Invalid registration secret.' });
+    }
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'url is required.' });
+    }
+    try {
+      new URL(url); // throws if not a valid URL
+    } catch {
+      return res.status(400).json({ error: 'url is not a valid URL.' });
+    }
+
+    await VisionNode.findOneAndUpdate(
+      { nodeId: 'primary' },
+      { url, lastSeenAt: new Date() },
+      { upsert: true, new: true }
+    );
+
+    res.json({ message: 'Vision node registered.', url });
+  } catch (err) {
+    console.error('[vision-node/register] error:', err.message);
+    res.status(500).json({ error: 'Registration failed.' });
+  }
 });
 
-module.exports = router;
+// GET /vision-node/status
+// Lets the extension (or you, manually) check whether the image pipeline
+// is currently available before even attempting an image analysis.
+router.get('/status', async (req, res) => {
+  try {
+    const node = await VisionNode.findOne({ nodeId: 'primary' });
+
+    if (!node) {
+      return res.json({ available: false, reason: 'No vision node has ever registered.' });
+    }
+
+    const isStale = Date.now() - node.lastSeenAt.getTime() > STALE_THRESHOLD_MS;
+    if (isStale) {
+      return res.json({
+        available: false,
+        reason: `Vision node last seen ${node.lastSeenAt.toISOString()} — considered offline.`,
+      });
+    }
+
+    res.json({ available: true, lastSeenAt: node.lastSeenAt });
+  } catch (err) {
+    console.error('[vision-node/status] error:', err.message);
+    res.status(500).json({ error: 'Could not check vision node status.' });
+  }
+});
+
+// Internal helper (not a route) — used by the /analyze route to get a
+// live, freshness-checked URL right before forwarding a request.
+async function getActiveVisionNodeUrl() {
+  const node = await VisionNode.findOne({ nodeId: 'primary' });
+  if (!node) return null;
+
+  const isStale = Date.now() - node.lastSeenAt.getTime() > STALE_THRESHOLD_MS;
+  if (isStale) return null;
+
+  return node.url;
+}
+
+module.exports = { router, getActiveVisionNodeUrl };

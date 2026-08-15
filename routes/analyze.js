@@ -57,6 +57,7 @@ router.post('/', requireAuth, async (req, res) => {
     tasks.push(
       (async () => {
         const visionNodeUrl = await getActiveVisionNodeUrl();
+        console.log(`[analyze][vision] Active vision node URL: ${visionNodeUrl || '(none — offline)'}`);
 
         if (!visionNodeUrl) {
           responsePayload.image_forensics = {
@@ -69,31 +70,78 @@ router.post('/', requireAuth, async (req, res) => {
           return;
         }
 
-        try {
-          const visionResponse = await axios.post(
-            `${visionNodeUrl}/analyze`,
-            { text, images, image_url: imageUrl },
-            {
-              timeout: VISION_REQUEST_TIMEOUT_MS,
-              headers: {
-                // Required for free-tier ngrok URLs — without this header,
-                // ngrok serves an interstitial browser warning page instead
-                // of forwarding the request, which can surface here as a
-                // malformed response or connection reset rather than a
-                // clean error.
-                'ngrok-skip-browser-warning': 'true',
-              },
-            }
-          );
+        // Retry once on transient connection-level failures (TLS handshake
+        // drops, ECONNRESET, etc.) before giving up. These are usually
+        // momentary — a flaky free ngrok tunnel, a brief hiccup — not a
+        // real "the laptop is offline" situation, so one retry avoids
+        // false negatives without masking a genuinely dead vision node.
+        const TRANSIENT_ERROR_CODES = new Set([
+          'ECONNRESET',
+          'ECONNREFUSED',
+          'ETIMEDOUT',
+          'EPIPE',
+          'ENOTFOUND',
+        ]);
+        const MAX_ATTEMPTS = 2;
 
-          responsePayload.image_forensics = visionResponse.data.image_forensics;
-          responsePayload.clip_semantic_alignment = visionResponse.data.clip_semantic_alignment;
-          responsePayload.reverse_image_search = visionResponse.data.reverse_image_search;
-          responsePayload.image_pipeline_available = true;
-        } catch (err) {
-          console.error('[analyze] vision node request failed:', err.message);
+        let lastError = null;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          const attemptStart = Date.now();
+          try {
+            console.log(
+              `[analyze][vision] Attempt ${attempt}/${MAX_ATTEMPTS} — POST ${visionNodeUrl}/analyze`
+            );
+            const visionResponse = await axios.post(
+              `${visionNodeUrl}/analyze`,
+              { text, images, image_url: imageUrl },
+              {
+                timeout: VISION_REQUEST_TIMEOUT_MS,
+                headers: {
+                  // Required for free-tier ngrok URLs — without this header,
+                  // ngrok serves an interstitial browser warning page instead
+                  // of forwarding the request, which can surface here as a
+                  // malformed response or connection reset rather than a
+                  // clean error.
+                  'ngrok-skip-browser-warning': 'true',
+                },
+              }
+            );
+
+            const elapsedMs = Date.now() - attemptStart;
+            console.log(
+              `[analyze][vision] Attempt ${attempt} succeeded in ${elapsedMs}ms — status ${visionResponse.status}`
+            );
+
+            responsePayload.image_forensics = visionResponse.data.image_forensics;
+            responsePayload.clip_semantic_alignment = visionResponse.data.clip_semantic_alignment;
+            responsePayload.reverse_image_search = visionResponse.data.reverse_image_search;
+            responsePayload.image_pipeline_available = true;
+            lastError = null;
+            break; // success — stop retrying
+          } catch (err) {
+            const elapsedMs = Date.now() - attemptStart;
+            lastError = err;
+            console.error(
+              `[analyze][vision] Attempt ${attempt} FAILED after ${elapsedMs}ms — ` +
+                `code=${err.code || 'unknown'} message="${err.message}"` +
+                (err.response ? ` httpStatus=${err.response.status}` : '')
+            );
+
+            const isTransient = err.code && TRANSIENT_ERROR_CODES.has(err.code);
+            const hasAttemptsLeft = attempt < MAX_ATTEMPTS;
+
+            if (isTransient && hasAttemptsLeft) {
+              console.log(`[analyze][vision] Error code "${err.code}" is transient — retrying...`);
+              continue;
+            }
+            // Non-transient error, or out of retries — stop here.
+            break;
+          }
+        }
+
+        if (lastError) {
           responsePayload.image_forensics = {
-            error: `Vision server did not respond in time or errored: ${err.message}`,
+            error: `Vision server did not respond in time or errored (code=${lastError.code || 'unknown'}): ${lastError.message}`,
           };
           responsePayload.image_pipeline_available = false;
         }

@@ -47,6 +47,7 @@ def register_once() -> bool:
         print("[heartbeat] VISION_NODE_SECRET is not set — cannot register. Set it and retry.")
         return False
 
+    print(f"[heartbeat] Attempting registration -> {MIDDLEWARE_URL}/vision-node/register")
     try:
         resp = requests.post(
             f"{MIDDLEWARE_URL}/vision-node/register",
@@ -56,6 +57,14 @@ def register_once() -> bool:
         resp.raise_for_status()
         print(f"[heartbeat] Registered OK: {resp.json()}")
         return True
+    except requests.exceptions.ConnectionError as e:
+        # This specific case — connection refused/unreachable — almost
+        # always means the middleware (server.js) simply isn't up yet, or
+        # was just restarted (e.g. by `node --watch` picking up a file
+        # change). It's expected/noisy during startup; only worth worrying
+        # about if it persists well past when the middleware should be up.
+        print(f"[heartbeat] Middleware unreachable (is it running yet?): {e}")
+        return False
     except requests.RequestException as e:
         print(f"[heartbeat] Registration failed: {e}")
         return False
@@ -66,8 +75,19 @@ def main():
     print(f"[heartbeat] Advertising vision node URL: {NGROK_URL}")
     print(f"[heartbeat] Sending a heartbeat every {HEARTBEAT_INTERVAL_SECONDS}s. Ctrl+C to stop.")
 
+    consecutive_failures = 0
     while True:
-        register_once()
+        success = register_once()
+        if success:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                print(
+                    f"[heartbeat] WARNING: {consecutive_failures} consecutive failures. "
+                    f"Double-check the middleware is running at {MIDDLEWARE_URL} "
+                    f"and that NGROK_URL still matches your currently-running ngrok session."
+                )
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
