@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const rateLimit = require('express-rate-limit');
 const { requireAuth } = require('../middleware/auth');
 const { getActiveVisionNodeUrl } = require('./visionNode');
 const Analysis = require('../models/Analysis');
@@ -9,13 +10,28 @@ const router = express.Router();
 
 const VISION_REQUEST_TIMEOUT_MS = 25000;
 
+// Each call here costs real money (Groq tokens) and hits a free-tier
+// search service — cap it per-user so a bug or bad actor can't run up
+// costs or exhaust ddgs_service. 20/15min is generous for genuine
+// interactive use, restrictive enough to stop abuse/loops.
+const analyzeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { error: 'Rate limit exceeded. Please wait a few minutes before analyzing more content.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Key by authenticated user, not just IP — otherwise multiple users
+  // behind the same NAT/office network would share one limit.
+  keyGenerator: (req) => (req.user ? req.user.id : req.ip),
+});
+
 // POST /analyze
 // Always runs the Groq-based text fact-check (if text is provided).
 // Only attempts the image pipeline (ViT/CLIP/reverse-image-search) if a
 // vision node is currently registered and reachable — otherwise responds
 // with a clear "image processing not available" status instead of
 // silently skipping it or hanging on a dead connection.
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, analyzeLimiter, async (req, res) => {
   const { text = '', images = [], image_url: imageUrl = null } = req.body;
 
   if (!text.trim() && images.length === 0) {
