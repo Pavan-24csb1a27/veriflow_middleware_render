@@ -81,24 +81,29 @@ async function fetchWebEvidence(searchQuery, maxResults = 3) {
     return [];
   }
 
-  // Render free-tier services spin down after ~15 min idle and can take
-  // 30-60+ seconds to cold-start on the next request. A single request
-  // with a short timeout can hit a 502 mid-wake-up. Retry once with a
-  // longer timeout on transient failures (502/503/connection errors)
-  // before giving up — the same pattern used for the vision node calls.
+  // Render free-tier services occasionally return an instant 502 on
+  // inter-service calls even when the target service is fully healthy
+  // (confirmed by comparing ddgs_service's own logs, which show zero
+  // failures for the exact same requests — this is a Render-side
+  // networking quirk between two free-tier services, not a real outage
+  // or cold start). A short delay + a few quick retries handles this
+  // far better than a long timeout, since these failures happen in
+  // under 50ms — waiting longer doesn't help, retrying does.
   const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504]);
   const TRANSIENT_ERROR_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE']);
   const attempts = [
-    { timeoutMs: 15000 },
-    { timeoutMs: 45000 },
-    { timeoutMs: 5000 },
-     // longer budget for a cold-start retry
+    { timeoutMs: 15000, delayBeforeMs: 0 },
+    { timeoutMs: 15000, delayBeforeMs: 300 },
+    { timeoutMs: 45000, delayBeforeMs: 800 }, // longer budget as a last resort, in case it IS a real cold start
   ];
 
   let lastErrorDetail = null;
 
   for (let i = 0; i < attempts.length; i++) {
-    const { timeoutMs } = attempts[i];
+    const { timeoutMs, delayBeforeMs } = attempts[i];
+    if (delayBeforeMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayBeforeMs));
+    }
     const attemptStart = Date.now();
     try {
       console.log(
