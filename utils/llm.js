@@ -90,10 +90,10 @@ async function fetchWebEvidence(searchQuery, maxResults = 3) {
   // far better than a long timeout, since these failures happen in
   // under 50ms — waiting longer doesn't help, retrying does.
   const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504]);
-  const TRANSIENT_ERROR_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE']);
+  const TRANSIENT_ERROR_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ECONNABORTED']);
   const attempts = [
-    { timeoutMs: 15000, delayBeforeMs: 0 },
-    { timeoutMs: 15000, delayBeforeMs: 300 },
+    { timeoutMs: 20000, delayBeforeMs: 0 },
+    { timeoutMs: 20000, delayBeforeMs: 300 },
     { timeoutMs: 45000, delayBeforeMs: 800 }, // longer budget as a last resort, in case it IS a real cold start
   ];
 
