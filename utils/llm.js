@@ -13,7 +13,10 @@
 const Groq = require('groq-sdk');
 const axios = require('axios');
 
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+// llama-3.3-70b-versatile was deprecated by Groq (June 2026). Using
+// openai/gpt-oss-120b as the replacement — Groq's own recommended
+// migration target, comparable capability/context window.
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 // URL of the small ddgs_service.py FastAPI wrapper (see ddgs_service.py).
 // Runs as its own lightweight service — no torch, no GPU — so it can
 // live on Render alongside/independent of the main middleware.

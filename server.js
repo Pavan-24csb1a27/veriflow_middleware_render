@@ -42,12 +42,42 @@ mongoose
     console.log('[server] MongoDB connected.');
     app.listen(PORT, () => {
       console.log(`[server] VeriFlow middleware running on port ${PORT}`);
+      startKeepAlivePing();
     });
   })
   .catch((err) => {
     console.error('[server] MongoDB connection failed:', err.message);
     process.exit(1);
   });
+
+// --- Keep-alive ping for ddgs_service ---
+// Render free-tier services sleep after ~15 min with no inbound traffic.
+// This periodically hits ddgs_service's /health endpoint so it never
+// goes fully idle, avoiding cold-start delays/502s on real user requests.
+// This only helps while THIS service (the middleware) is itself awake —
+// pair with an external pinger (e.g. cron-job.org, UptimeRobot, free)
+// hitting both services' /health endpoints for full coverage even if
+// both happen to go idle at the same time.
+const axios = require('axios');
+const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000; // 10 min — comfortably under the ~15 min sleep threshold
+
+function startKeepAlivePing() {
+  if (!process.env.DDGS_SERVICE_URL) return;
+
+  const ping = async () => {
+    try {
+      const start = Date.now();
+      await axios.get(`${process.env.DDGS_SERVICE_URL}/health`, { timeout: 20000 });
+      console.log(`[keep-alive] ddgs_service ping OK (${Date.now() - start}ms)`);
+    } catch (err) {
+      console.warn(`[keep-alive] ddgs_service ping failed: ${err.message}`);
+    }
+  };
+
+  ping(); // fire once immediately on boot, then on the interval
+  setInterval(ping, KEEP_ALIVE_INTERVAL_MS);
+  console.log(`[keep-alive] Pinging ddgs_service every ${KEEP_ALIVE_INTERVAL_MS / 60000} min.`);
+}
 
 // --- Loud shutdown logging ---
 // If you're running with `npm run dev` (node --watch), ANY file save in
