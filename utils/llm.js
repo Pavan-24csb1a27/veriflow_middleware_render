@@ -43,7 +43,16 @@ async function groqJsonCall(prompt) {
     response_format: { type: 'json_object' },
   });
   const raw = completion.choices[0].message.content;
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch (parseErr) {
+    // Log the actual raw response so a malformed-JSON failure is
+    // diagnosable instead of a silent fallback with no visibility into
+    // what Groq actually sent back.
+    console.error(`[llm.js] Failed to parse Groq JSON response: ${parseErr.message}`);
+    console.error(`[llm.js] Raw response (first 500 chars): ${raw ? raw.slice(0, 500) : '(empty)'}`);
+    throw parseErr;
+  }
 }
 
 async function decomposeClaim(claimText) {
@@ -72,8 +81,33 @@ Respond ONLY with a valid JSON object matching this schema:
     }
     return claims;
   } catch (err) {
-    const fallbackClaim = claimText.trim().slice(0, 150);
-    return [{ claim: fallbackClaim, search_query: fallbackClaim.slice(0, 60) }];
+    // Previously this failure was silent — no log at all — which made it
+    // impossible to tell "Groq decomposition failed" apart from "it
+    // worked fine." Log it so future failures are diagnosable.
+    console.error(`[llm.js] decomposeClaim fell back to raw-text mode: ${err.message}`);
+
+    // The old fallback used claimText.slice(0, 60) as the SEARCH QUERY,
+    // which just chops off mid-sentence (e.g. "...is a Polish sta") —
+    // guaranteed to return zero search results since it's not a real
+    // query, just a truncated fragment. Extract a cleaner short subject
+    // instead: take the first sentence/clause, which for Wikipedia-style
+    // pasted text is usually the name + core identifying fact.
+    const trimmed = claimText.trim();
+    const firstSentenceMatch = trimmed.match(/^(.+?[.!?])\s/);
+    const firstSentence = firstSentenceMatch ? firstSentenceMatch[1] : trimmed.slice(0, 200);
+
+    // Strip citation markers like [1], [23] and parenthetical asides,
+    // which pollute search queries and rarely help find results.
+    const cleanedForSearch = firstSentence
+      .replace(/\[\d+\]/g, '')
+      .replace(/\([^)]{0,80}\)/g, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+
+    const fallbackClaim = firstSentence.replace(/\[\d+\]/g, '').trim().slice(0, 200);
+    const fallbackQuery = cleanedForSearch.slice(0, 80);
+
+    return [{ claim: fallbackClaim, search_query: fallbackQuery }];
   }
 }
 
