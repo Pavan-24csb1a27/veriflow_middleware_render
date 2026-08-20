@@ -20,6 +20,17 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
+// GEMINI_API_KEY is a soft dependency — the fact-check pipeline falls
+// back to Gemini automatically if Groq fails (deprecated model, outage,
+// rate limit, etc.), but will still work on Groq alone if this isn't
+// set. Warn rather than hard-fail, since the app is still functional.
+if (!process.env.GEMINI_API_KEY) {
+  console.warn(
+    '[server] GEMINI_API_KEY is not set — the Groq-failure fallback will not work. ' +
+      'Set it for extra resilience if Groq has an outage or deprecates a model again.'
+  );
+}
+
 // --- CORS: scope to your actual extension, not "*" ---
 const allowedOrigin = process.env.ALLOWED_ORIGIN || '*';
 app.use(cors({ origin: allowedOrigin }));

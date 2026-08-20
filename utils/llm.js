@@ -17,25 +17,28 @@ const axios = require('axios');
 // openai/gpt-oss-120b as the replacement — Groq's own recommended
 // migration target, comparable capability/context window.
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
 // URL of the small ddgs_service.py FastAPI wrapper (see ddgs_service.py).
 // Runs as its own lightweight service — no torch, no GPU — so it can
 // live on Render alongside/independent of the main middleware.
 const DDGS_SERVICE_URL = process.env.DDGS_SERVICE_URL;
 const DDGS_SERVICE_SECRET = process.env.DDGS_SERVICE_SECRET;
 
-let _client = null;
-function getClient() {
-  if (!_client) {
+let _groqClient = null;
+function getGroqClient() {
+  if (!_groqClient) {
     if (!process.env.GROQ_API_KEY) {
       throw new Error('GROQ_API_KEY is not set in this process\'s environment.');
     }
-    _client = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    _groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY });
   }
-  return _client;
+  return _groqClient;
 }
 
 async function groqJsonCall(prompt) {
-  const client = getClient();
+  const client = getGroqClient();
   const completion = await client.chat.completions.create({
     model: GROQ_MODEL,
     messages: [{ role: 'user', content: prompt }],
@@ -43,15 +46,72 @@ async function groqJsonCall(prompt) {
     response_format: { type: 'json_object' },
   });
   const raw = completion.choices[0].message.content;
+  return parseJsonOrThrow(raw, 'Groq');
+}
+
+async function geminiJsonCall(prompt) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY is not set — cannot use Gemini fallback.');
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  const resp = await axios.post(
+    url,
+    {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.0,
+        responseMimeType: 'application/json',
+      },
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': GEMINI_API_KEY,
+      },
+      timeout: 20000,
+    }
+  );
+
+  const raw = resp.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!raw) {
+    throw new Error('Gemini response had no usable text content.');
+  }
+  return parseJsonOrThrow(raw, 'Gemini');
+}
+
+function parseJsonOrThrow(raw, providerName) {
   try {
     return JSON.parse(raw);
   } catch (parseErr) {
-    // Log the actual raw response so a malformed-JSON failure is
-    // diagnosable instead of a silent fallback with no visibility into
-    // what Groq actually sent back.
-    console.error(`[llm.js] Failed to parse Groq JSON response: ${parseErr.message}`);
+    console.error(`[llm.js] Failed to parse ${providerName} JSON response: ${parseErr.message}`);
     console.error(`[llm.js] Raw response (first 500 chars): ${raw ? raw.slice(0, 500) : '(empty)'}`);
     throw parseErr;
+  }
+}
+
+/**
+ * Tries Groq first (fast, cheap). If that call fails for ANY reason —
+ * deprecated model, malformed JSON, rate limit, network error — falls
+ * back to Gemini automatically before giving up. This is what makes the
+ * pipeline resilient to a single provider silently deprecating a model
+ * or having an outage, which is a real, documented risk with free-tier
+ * LLM APIs (this is exactly what broke this pipeline once already).
+ */
+async function getStructuredJson(prompt) {
+  try {
+    return await groqJsonCall(prompt);
+  } catch (groqErr) {
+    console.warn(`[llm.js] Groq call failed (${groqErr.message}) — falling back to Gemini.`);
+    try {
+      return await geminiJsonCall(prompt);
+    } catch (geminiErr) {
+      console.error(`[llm.js] Gemini fallback also failed: ${geminiErr.message}`);
+      // Surface the ORIGINAL Groq error as the primary failure reason,
+      // since that's usually more diagnostic (Gemini failing too is often
+      // just "no API key configured" rather than the real root cause).
+      throw new Error(`Both providers failed. Groq: ${groqErr.message} | Gemini: ${geminiErr.message}`);
+    }
   }
 }
 
@@ -70,7 +130,7 @@ Respond ONLY with a valid JSON object matching this schema:
 {"claims": [{"claim": "string", "search_query": "string"}]}`;
 
   try {
-    const parsed = await groqJsonCall(prompt);
+    const parsed = await getStructuredJson(prompt);
     let claims = parsed.claims;
     if (!Array.isArray(claims) || claims.length === 0) {
       throw new Error('empty claims list');
@@ -215,7 +275,7 @@ Respond ONLY with a valid JSON object matching this exact schema:
 {"status": "SUPPORTED|REFUTED|NOT_ENOUGH_INFO", "rationale": "Brief explanation of your ruling, referencing which source (if any)", "source_quote": "The exact sentence/quote from the evidence that proves your point (or empty string if none)"}`;
 
   try {
-    const parsed = await groqJsonCall(prompt);
+    const parsed = await getStructuredJson(prompt);
     let status = parsed.status;
     if (!['SUPPORTED', 'REFUTED', 'NOT_ENOUGH_INFO'].includes(status)) {
       status = 'NOT_ENOUGH_INFO';
