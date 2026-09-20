@@ -119,6 +119,12 @@ router.post('/', requireAuth, analyzeLimiter, async (req, res) => {
                   // malformed response or connection reset rather than a
                   // clean error.
                   'ngrok-skip-browser-warning': 'true',
+                  // Authenticates this request to the laptop's FastAPI
+                  // service — without this, anyone who discovers the
+                  // ngrok URL could send requests through it directly,
+                  // bypassing the middleware (and its auth/rate-limiting)
+                  // entirely.
+                  'X-Vision-Secret': process.env.VISION_NODE_SECRET,
                 },
               }
             );
